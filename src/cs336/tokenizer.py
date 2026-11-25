@@ -166,17 +166,105 @@ def train_bpe(
 
     return vocab, merges
 
-def save_bpe(vocab, merges, vocab_path, merges_path):
-    # vocab：token_id -> bytes，存成可读格式
-    with open(vocab_path, "w", encoding="utf-8") as f:
-        for tid, token_bytes in vocab.items():
-            f.write(json.dumps([tid, token_bytes.decode("utf-8", errors="backslashreplace")]) + "\n")
 
-    # merges：有序的 (a, b) 规则列表
-    with open(merges_path, "w", encoding="utf-8") as f:
-        for a, b in merges:
-            f.write(f"{a.decode('utf-8', errors='backslashreplace')} "
-                    f"{b.decode('utf-8', errors='backslashreplace')}\n")
+
+# 几个 unicode 和字节的类型转换函数
+def bytes_to_unicode() -> dict[int, str]:
+    bs = (
+        list(range(ord("!"), ord("~") + 1))
+        + list(range(ord("¡"), ord("¬") + 1))
+        + list(range(ord("®"), ord("ÿ") + 1))
+    )
+    cs = bs[:]
+    n = 0
+
+    for byte in range(256):
+        if byte not in bs:
+            bs.append(byte)
+            cs.append(256 + n)
+            n += 1
+
+    return dict(zip(bs, map(chr, cs)))
+
+
+BYTE_ENCODER = bytes_to_unicode()
+BYTE_DECODER = {character: byte for byte, character in BYTE_ENCODER.items()}
+
+
+def token_to_unicode(token: bytes) -> str:
+    return "".join(BYTE_ENCODER[byte] for byte in token)
+
+
+def unicode_to_token(text: str) -> bytes:
+    try:
+        return bytes(BYTE_DECODER[character] for character in text)
+    except KeyError as error:
+        raise ValueError(f"Invalid encoded token: {text!r}") from error
+
+
+def save_bpe(
+    vocab: dict[int, bytes],
+    merges: list[tuple[bytes, bytes]],
+    vocab_path: str | os.PathLike[str],
+    merges_path: str | os.PathLike[str],
+) -> None:
+    """Save a BPE vocabulary and its ordered merge rules losslessly."""
+    encoded_vocab: dict[str, int] = {}
+    for token_id, token_bytes in sorted(vocab.items()):
+        encoded_token = token_to_unicode(token_bytes)
+        if encoded_token in encoded_vocab:
+            raise ValueError(
+                f"Duplicate vocabulary token at IDs "
+                f"{encoded_vocab[encoded_token]} and {token_id}"
+            )
+        encoded_vocab[encoded_token] = token_id
+
+    with open(vocab_path, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(encoded_vocab, f, ensure_ascii=False)
+        f.write("\n")
+
+    # Byte-to-unicode encoding never emits an ASCII space, so it is safe to
+    # use one space as the separator between the two merge operands.
+    with open(merges_path, "w", encoding="utf-8", newline="\n") as f:
+        for left, right in merges:
+            f.write(f"{token_to_unicode(left)} {token_to_unicode(right)}\n")
+
+
+def load_bpe(
+    vocab_path: str | os.PathLike[str],
+    merges_path: str | os.PathLike[str],
+) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+    """Load a vocabulary and ordered merges written by :func:`save_bpe`."""
+    with open(vocab_path, "r", encoding="utf-8") as f:
+        encoded_vocab = json.load(f)
+
+    if not isinstance(encoded_vocab, dict):
+        raise ValueError("Vocabulary file must contain a JSON object")
+
+    vocab: dict[int, bytes] = {}
+    for encoded_token, token_id in encoded_vocab.items():
+        if not isinstance(encoded_token, str):
+            raise ValueError(f"Invalid vocabulary token: {encoded_token!r}")
+        if not isinstance(token_id, int) or isinstance(token_id, bool):
+            raise ValueError(f"Invalid token ID: {token_id!r}")
+        if token_id in vocab:
+            raise ValueError(f"Duplicate token ID in vocabulary: {token_id}")
+        vocab[token_id] = unicode_to_token(encoded_token)
+
+    merges: list[tuple[bytes, bytes]] = []
+    with open(merges_path, "r", encoding="utf-8") as f:
+        for line_number, line in enumerate(f, start=1):
+            fields = line.rstrip("\n").split(" ")
+            if len(fields) != 2:
+                raise ValueError(
+                    f"Invalid merge on line {line_number}: {line.rstrip()!r}"
+                )
+            merges.append(
+                (unicode_to_token(fields[0]), unicode_to_token(fields[1]))
+            )
+
+    return vocab, merges
+
 
 ## Usage
 def main() -> None:
@@ -185,7 +273,7 @@ def main() -> None:
         pretoken_counts = build_pretoken_counts(PATH, boundaries)
         splits, specials = to_bpe_input(pretoken_counts)
         vocab, merges = train_bpe(splits, VOCAB_SIZE, SPECIAL_TOKENS)
-        save_bpe(vocab, merges, "vocab.jsonl", "merges.txt")
+        save_bpe(vocab, merges, "vocab.json", "merges.txt")
         
 if __name__ == "__main__":
     main()

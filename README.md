@@ -46,7 +46,7 @@ uv run cs336
 uv run python -m cs336.tokenizer
 ```
 
-训练会覆盖项目根目录下的 `vocab.jsonl` 和 `merges.txt`。当前 TinyStories
+训练会覆盖项目根目录下的 `vocab.json` 和 `merges.txt`。当前 TinyStories
 数据较大，完整训练需要较长时间。
 
 训练流水线如下：
@@ -76,7 +76,21 @@ vocab_size - 256 - special_token_count
 ## 使用 tokenizer、encoder 与 decoder
 
 `train_bpe()` 返回内存中的 `vocab` 和有序 `merges`。`BPEEncoder` 和
-`BPEDecoder` 直接使用这两个对象，不依赖当前不可逆的存盘格式。
+`BPEDecoder` 可以直接使用这两个对象，也可以通过 `load_bpe()` 从磁盘恢复。
+
+`save_bpe()` 使用 GPT-2 的 byte-to-unicode 映射，将 vocab 保存为 JSON
+对象，并将 merges 保存为每行两个 token。该格式可以无歧义地保存任意字节、
+前导空格、换行和无效 UTF-8 byte：
+
+```python
+from cs336.tokenizer import load_bpe, save_bpe
+
+save_bpe(vocab, merges, "vocab.json", "merges.txt")
+loaded_vocab, loaded_merges = load_bpe("vocab.json", "merges.txt")
+
+assert loaded_vocab == vocab
+assert loaded_merges == merges
+```
 
 下面的小语料会实际执行训练、编码和解码：
 
@@ -212,11 +226,9 @@ git diff --check
 
 ## 已知问题
 
-1. `save_bpe()` 生成的格式不是可逆格式。`backslashreplace` 会把
-   `byte >= 128` 写成字面量 `\xNN`；`merges.txt` 又使用空格分隔 token，
-   无法区分前导空格、换行以及部分无效 UTF-8 byte。因此当前
-   `vocab.jsonl`、`merges.txt` 不能可靠地还原为训练得到的 bytes，也还没有实现
-   loader。现阶段请把 `train_bpe()` 的返回值直接传给 encoder/decoder。
+1. 旧版 `vocab.jsonl` 和 `merges.txt` 包含不可逆的 `backslashreplace` 编码。
+   需要重新训练并生成新的 `vocab.json` 和 `merges.txt`，不要用 `load_bpe()`
+   读取旧文件。
 
 2. `encode_iterable()` 会把每个元素当作独立文本。如果某个 special token 被拆到
    两个元素中，例如 `"<|endof"` 和 `"text|>"`，它不会被识别为 special token。
