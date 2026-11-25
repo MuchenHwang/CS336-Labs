@@ -9,3 +9,7 @@ wheels/
 # Virtual environments
 .venv
 .txt
+.jsonl
+
+#datafiles
+data/TinyStoriesV2-GPT4-train.txt
