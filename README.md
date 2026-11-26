@@ -176,9 +176,10 @@ config = TransformerConfig(
 )
 model = TransformerLM(config)
 
-token_ids = torch.randint(0, config.vocab_size, (2, 128))
-targets = token_ids.roll(shifts=-1, dims=1)
-logits, loss = model(token_ids, targets)
+token_ids = torch.randint(0, config.vocab_size, (2, 129))
+inputs = token_ids[:, :-1]
+targets = token_ids[:, 1:]
+logits, loss = model(inputs, targets)
 
 assert logits.shape == (2, 128, config.vocab_size)
 assert loss.ndim == 0
@@ -187,6 +188,123 @@ assert loss.ndim == 0
 模型默认使用预归一化残差块、RoPE、无 bias 的线性层、SwiGLU 和 tied token
 embeddings。`context_length` 是位置编码允许的最大序列长度；输入更长时模型会
 直接报错。
+
+## 训练 Transformer 模型
+
+`model.py` 只提供模型定义和前向损失，没有内置数据集、训练循环或命令行入口。
+因此不能通过 `python -m cs336.model` 启动训练，需要在脚本中创建优化器，并让
+`TransformerLM` 同时接收输入 token 和对应的下一 token。
+
+训练前先确认 BPE 词表和训练样本存在：
+
+```bash
+test -f vocab.json
+test -f merges.txt
+test -f tests/fixtures/tinystories_sample.txt
+```
+
+下面的命令使用仓库自带的小样本完成一次可复现的训练冒烟测试，并保存
+`model.pt`。它会实际执行前向传播、反向传播、梯度裁剪、AdamW 更新和
+checkpoint 保存：
+
+```bash
+uv run python - <<'PY'
+from pathlib import Path
+
+import torch
+
+from cs336.encoder import BPEEncoder
+from cs336.model import TransformerConfig, TransformerLM
+from cs336.tokenizer import SPECIAL_TOKENS, load_bpe
+
+torch.manual_seed(0)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+vocab, merges = load_bpe("vocab.json", "merges.txt")
+tokenizer = BPEEncoder(vocab, merges, SPECIAL_TOKENS)
+text = Path("tests/fixtures/tinystories_sample.txt").read_text(
+    encoding="utf-8"
+)
+token_ids = torch.tensor(tokenizer.encode(text), dtype=torch.long)
+
+context_length = 64
+batch_size = 4
+config = TransformerConfig(
+    vocab_size=len(vocab),
+    context_length=context_length,
+    d_model=128,
+    num_layers=2,
+    num_heads=4,
+    dropout=0.1,
+)
+model = TransformerLM(config).to(device)
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+max_start = token_ids.numel() - context_length - 1
+if max_start < 0:
+    raise ValueError("训练文本太短，无法构造一个完整上下文")
+
+model.train()
+num_steps = 20
+for step in range(1, num_steps + 1):
+    starts = torch.randint(0, max_start + 1, (batch_size,))
+    chunks = torch.stack(
+        [
+            token_ids[start : start + context_length + 1]
+            for start in starts
+        ]
+    ).to(device)
+
+    inputs = chunks[:, :-1]
+    targets = chunks[:, 1:]
+    _, loss = model(inputs, targets)
+
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    optimizer.step()
+
+    if step == 1 or step % 5 == 0:
+        print(f"step={step}, loss={loss.detach().item():.4f}")
+
+torch.save(
+    {
+        "model": model.state_dict(),
+        "config": {
+            "vocab_size": config.vocab_size,
+            "context_length": config.context_length,
+            "d_model": config.d_model,
+            "num_layers": config.num_layers,
+            "num_heads": config.num_heads,
+            "d_ff": config.d_ff,
+            "dropout": config.dropout,
+        },
+        "step": num_steps,
+    },
+    "model.pt",
+)
+print(f"checkpoint saved to model.pt on {device}")
+PY
+```
+
+训练是否能够正常推进，主要看每一步的 loss 是有限值，并确认 checkpoint 已生成：
+
+```bash
+test -f model.pt && echo "model checkpoint found"
+```
+
+完整训练 TinyStories 时，不要用 `Path.read_text()` 一次加载 2.1 GB 文本，也不要
+一次保存全部 token ID。应流式读取并按块编码，将 token ID 写入二进制文件，再
+通过内存映射（`numpy.memmap`）构造训练批次。每个批次满足：
+
+- `inputs` 和 `targets` 的形状都是 `(batch_size, context_length)`。
+- `targets` 是 `inputs` 在原始 token 流中的下一位，即 `chunk[:-1]` 和
+  `chunk[1:]`。
+- `context_length` 不能超过 `TransformerConfig.context_length`。
+- 所有 token ID 必须处于 `[0, vocab_size)`。
+
+当前训练示例没有学习率调度、验证集评估和断点恢复。正式训练时建议先实现这些
+功能，再按实际显存调整 `batch_size`、`context_length`、`d_model` 和层数。
 
 ## 调试方法
 

@@ -13,6 +13,7 @@ from torch import Tensor
 
 from cs336.decoder import BPEDecoder
 from cs336.encoder import BPEEncoder
+from cs336.optimizer import AdamW, get_lr_cosine_schedule
 from cs336.tokenizer import pre_tokenize, to_bpe_input, train_bpe
 
 
@@ -474,7 +475,7 @@ def get_adamw_cls() -> Any:
     """
     Returns a torch.optim.Optimizer that implements AdamW.
     """
-    raise NotImplementedError
+    return AdamW
 
 
 def run_get_lr_cosine_schedule(
@@ -483,7 +484,7 @@ def run_get_lr_cosine_schedule(
     min_learning_rate: float,
     warmup_iters: int,
     cosine_cycle_iters: int,
-):
+) -> float:
     """
     Given the parameters of a cosine learning rate decay schedule (with linear
     warmup) and an iteration number, return the learning rate at the given
@@ -502,7 +503,13 @@ def run_get_lr_cosine_schedule(
     Returns:
         Learning rate at the given iteration under the specified schedule.
     """
-    raise NotImplementedError
+    return get_lr_cosine_schedule(
+        it=it,
+        max_learning_rate=max_learning_rate,
+        min_learning_rate=min_learning_rate,
+        warmup_iters=warmup_iters,
+        cosine_cycle_iters=cosine_cycle_iters,
+    )
 
 
 def run_save_checkpoint(
