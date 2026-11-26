@@ -158,7 +158,7 @@ def train_bpe(
         pair_counts = count_pairs(splits)
         if not pair_counts:
             break
-        # 最高频 pair；平局按字节序取较小者，保证可复现
+        # 最高频 pair；平局按字节序取较大者，保证可复现
         best = max(pair_counts, key=lambda p: (pair_counts[p], p))
         merges.append(best)
         vocab[len(vocab)] = best[0] + best[1]

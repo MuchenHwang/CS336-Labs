@@ -5,6 +5,8 @@
 - `src/cs336/tokenizer.py`：BPE 训练、预分词、merge 学习与结果保存。
 - `src/cs336/encoder.py`：将文本转换为 token ID。
 - `src/cs336/decoder.py`：将 token ID 还原为文本。
+- `src/cs336/model.py`：带 RoPE、RMSNorm、因果注意力和 SwiGLU 的
+  decoder-only Transformer 语言模型。
 
 以下命令均在项目根目录运行。
 
@@ -154,6 +156,38 @@ text = decoder.decode(token_ids)
 streamed_text = list(decoder.decode_iterable([[token_ids]]))
 ```
 
+## Transformer 语言模型
+
+`TransformerLM` 接收形状为 `(batch, sequence)` 的 token ID，并输出每个位置
+对下一个 token 的 logits。传入 targets 时同时返回交叉熵损失：
+
+```python
+import torch
+
+from cs336.model import TransformerConfig, TransformerLM
+
+config = TransformerConfig(
+    vocab_size=10_000,
+    context_length=256,
+    d_model=512,
+    num_layers=4,
+    num_heads=8,
+    dropout=0.1,
+)
+model = TransformerLM(config)
+
+token_ids = torch.randint(0, config.vocab_size, (2, 128))
+targets = token_ids.roll(shifts=-1, dims=1)
+logits, loss = model(token_ids, targets)
+
+assert logits.shape == (2, 128, config.vocab_size)
+assert loss.ndim == 0
+```
+
+模型默认使用预归一化残差块、RoPE、无 bias 的线性层、SwiGLU 和 tied token
+embeddings。`context_length` 是位置编码允许的最大序列长度；输入更长时模型会
+直接报错。
+
 ## 调试方法
 
 先检查预分词结果，确认 special token 没有进入普通正则切片：
@@ -221,8 +255,16 @@ PYTHONDONTWRITEBYTECODE=1 uv run python -c \
 git diff --check
 ```
 
-项目目前没有正式测试目录，因此 `pytest` 不会提供额外测试覆盖。需要回归测试时，
-应把上面的 round-trip、special-token、空白和 Unicode 用例加入 `tests/`。
+运行正式测试：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 uv run pytest -q
+```
+
+当前测试覆盖 RMSNorm、RoPE、模型前向与反向传播、因果掩码、上下文长度限制、
+embedding tying 和交叉熵，并包含 Stanford CS336 官方的 tokenizer 与 BPE 测试。
+官方 BPE 速度测试要求小语料训练在 1.5 秒内完成；当前实现约需 2.1 秒，因此完整
+测试套件会在 `test_train_bpe_speed` 处失败。
 
 ## 已知问题
 
