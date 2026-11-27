@@ -47,6 +47,7 @@ dependencies = [
 
 [project.scripts]
 cs336 = "cs336.tokenizer:main"
+cs336-train = "cs336.train:main"
 
 [build-system]
 requires = ["uv_build>=0.13.1,<0.14.0"]

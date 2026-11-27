@@ -1,12 +1,18 @@
 # TransformerLab
 
-从零实现 BPE 分词器、编码器与解码器。当前模块包括：
+从零实现 BPE 分词器、编码器、解码器、Transformer 语言模型和 Muon 训练
+优化器。当前模块包括：
 
 - `src/cs336/tokenizer.py`：BPE 训练、预分词、merge 学习与结果保存。
 - `src/cs336/encoder.py`：将文本转换为 token ID。
 - `src/cs336/decoder.py`：将 token ID 还原为文本。
 - `src/cs336/model.py`：带 RoPE、RMSNorm、因果注意力和 SwiGLU 的
   decoder-only Transformer 语言模型。
+- `src/cs336/optimizer.py`：面向二维权重的 Muon 优化器、非矩阵参数的自适应
+  回退，以及线性 warmup + 余弦退火学习率调度。
+- `src/cs336/train.py`：二进制 token 缓存、内存映射采样、训练循环、验证、
+  梯度裁剪和 checkpoint 保存/恢复。
+- `src/cs336/vector_add_cuda.cu`：PyTorch C++/CUDA 扩展的最小向量加法示例。
 
 以下命令均在项目根目录运行。
 
@@ -189,11 +195,124 @@ assert loss.ndim == 0
 embeddings。`context_length` 是位置编码允许的最大序列长度；输入更长时模型会
 直接报错。
 
+## Muon 优化器与学习率调度
+
+`Muon` 对二维矩阵参数使用 SGD 风格动量，再通过 5 步 Newton-Schulz 迭代将更新
+近似正交化。它使用 `betas[0]` 作为动量系数并启用 Nesterov 动量，最后应用解耦
+权重衰减。一维和标量参数使用自适应二阶矩更新，以便直接优化 RMSNorm 等参数。
+
+训练脚本直接导入 `Muon`：
+
+```python
+from cs336.optimizer import Muon
+
+optimizer = Muon(
+    model.parameters(),
+    lr=3e-4,
+    betas=(0.9, 0.999),
+    eps=1e-8,
+    weight_decay=0.01,
+)
+```
+
+当前构造函数没有参数名称信息，因此所有二维参数都会使用 Muon，包括 embedding
+和输出头。正式训练时可以把二维权重与一维参数放入不同 parameter group，并为
+两部分分别配置学习率：
+
+```python
+matrix_params = [p for p in model.parameters() if p.ndim == 2]
+other_params = [p for p in model.parameters() if p.ndim < 2]
+
+optimizer = Muon(
+    [
+        {
+            "params": matrix_params,
+            "lr": 0.02,
+            "weight_decay": 0.01,
+        },
+        {
+            "params": other_params,
+            "lr": 3e-4,
+            "weight_decay": 0.01,
+        },
+    ]
+)
+```
+
+`get_lr_cosine_schedule()` 返回指定 iteration 的学习率，但不会自行修改优化器：
+
+- `it < warmup_iters` 时，学习率从 0 线性增加到 `max_learning_rate`。
+- `warmup_iters <= it <= cosine_cycle_iters` 时，按余弦曲线衰减。
+- 超过 `cosine_cycle_iters` 后，保持 `min_learning_rate`。
+
+```python
+from cs336.optimizer import get_lr_cosine_schedule
+
+learning_rate = get_lr_cosine_schedule(
+    it=20,
+    max_learning_rate=3e-4,
+    min_learning_rate=3e-5,
+    warmup_iters=10,
+    cosine_cycle_iters=1000,
+)
+
+for group in optimizer.param_groups:
+    group["lr"] = learning_rate
+```
+
 ## 训练 Transformer 模型
 
-`model.py` 只提供模型定义和前向损失，没有内置数据集、训练循环或命令行入口。
-因此不能通过 `python -m cs336.model` 启动训练，需要在脚本中创建优化器，并让
-`TransformerLM` 同时接收输入 token 和对应的下一 token。
+`model.py` 只提供模型定义和前向损失。训练编排由 `train.py` 负责，它会把
+`TransformerLM`、`Muon`、学习率调度、批次采样和 checkpoint 连接起来。
+
+使用仓库自带的小样本执行训练：
+
+```bash
+uv run cs336-train \
+  --data tests/fixtures/tinystories_sample.txt \
+  --cache data/tinystories_tokens.bin \
+  --max-steps 20 \
+  --warmup-steps 5 \
+  --batch-size 4 \
+  --context-length 64 \
+  --checkpoint checkpoints/tinystories.pt
+```
+
+断点续训时增加：
+
+```bash
+uv run cs336-train \
+  --data tests/fixtures/tinystories_sample.txt \
+  --cache data/tinystories_tokens.bin \
+  --max-steps 40 \
+  --warmup-steps 5 \
+  --checkpoint checkpoints/tinystories.pt \
+  --resume-from checkpoints/tinystories.pt
+```
+
+也可以直接运行模块：
+
+```bash
+uv run python -m cs336.train --help
+```
+
+首次运行会把文本按块编码到 `data/tinystories_tokens.bin`，并在相邻的
+`tokens.bin.json` 中记录源文件、词表、merge、特殊 token、dtype 和 token 数量。
+之后的训练通过 `numpy.memmap` 直接从该文件采样，不会再次执行 BPE。
+
+缓存默认使用 `uint16`，10000 词表只占每个 token 2 字节；词表超过 `uint16`
+范围时应改用 `--token-dtype int32`。源文本、词表、merge 或截断长度发生变化时，
+缓存会自动重建。也可以显式强制重建：
+
+```bash
+uv run cs336-train \
+  --data data/TinyStoriesV2-GPT4-train.txt \
+  --cache data/tinystories_tokens.bin \
+  --token-dtype uint16 \
+  --rebuild-cache
+```
+
+`data/*.bin`、缓存元数据和 checkpoint 都已加入 `.gitignore`。
 
 训练前先确认 BPE 词表和训练样本存在：
 
@@ -204,7 +323,7 @@ test -f tests/fixtures/tinystories_sample.txt
 ```
 
 下面的命令使用仓库自带的小样本完成一次可复现的训练冒烟测试，并保存
-`model.pt`。它会实际执行前向传播、反向传播、梯度裁剪、AdamW 更新和
+`model.pt`。它会实际执行前向传播、反向传播、梯度裁剪、Muon 更新和
 checkpoint 保存：
 
 ```bash
@@ -215,6 +334,7 @@ import torch
 
 from cs336.encoder import BPEEncoder
 from cs336.model import TransformerConfig, TransformerLM
+from cs336.optimizer import Muon, get_lr_cosine_schedule
 from cs336.tokenizer import SPECIAL_TOKENS, load_bpe
 
 torch.manual_seed(0)
@@ -238,15 +358,33 @@ config = TransformerConfig(
     dropout=0.1,
 )
 model = TransformerLM(config).to(device)
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+num_steps = 20
+warmup_steps = 5
+max_learning_rate = 3e-4
+min_learning_rate = 3e-5
+optimizer = Muon(
+    model.parameters(),
+    lr=max_learning_rate,
+    weight_decay=0.01,
+)
 
 max_start = token_ids.numel() - context_length - 1
 if max_start < 0:
     raise ValueError("训练文本太短，无法构造一个完整上下文")
 
 model.train()
-num_steps = 20
-for step in range(1, num_steps + 1):
+for step in range(num_steps):
+    learning_rate = get_lr_cosine_schedule(
+        it=step,
+        max_learning_rate=max_learning_rate,
+        min_learning_rate=min_learning_rate,
+        warmup_iters=warmup_steps,
+        cosine_cycle_iters=num_steps - 1,
+    )
+    for group in optimizer.param_groups:
+        group["lr"] = learning_rate
+
     starts = torch.randint(0, max_start + 1, (batch_size,))
     chunks = torch.stack(
         [
@@ -264,8 +402,12 @@ for step in range(1, num_steps + 1):
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     optimizer.step()
 
-    if step == 1 or step % 5 == 0:
-        print(f"step={step}, loss={loss.detach().item():.4f}")
+    completed_steps = step + 1
+    if completed_steps == 1 or completed_steps % 5 == 0:
+        print(
+            f"step={completed_steps}, lr={learning_rate:.2e}, "
+            f"loss={loss.detach().item():.4f}"
+        )
 
 torch.save(
     {
@@ -293,9 +435,9 @@ PY
 test -f model.pt && echo "model checkpoint found"
 ```
 
-完整训练 TinyStories 时，不要用 `Path.read_text()` 一次加载 2.1 GB 文本，也不要
-一次保存全部 token ID。应流式读取并按块编码，将 token ID 写入二进制文件，再
-通过内存映射（`numpy.memmap`）构造训练批次。每个批次满足：
+`cs336-train` 会流式读取文本、按块编码到二进制缓存，再通过内存映射
+（`numpy.memmap`）构造训练批次，不会把完整的 Python `list[int]` 或整个数据集
+加载进内存。每个批次满足：
 
 - `inputs` 和 `targets` 的形状都是 `(batch_size, context_length)`。
 - `targets` 是 `inputs` 在原始 token 流中的下一位，即 `chunk[:-1]` 和
@@ -303,8 +445,9 @@ test -f model.pt && echo "model checkpoint found"
 - `context_length` 不能超过 `TransformerConfig.context_length`。
 - 所有 token ID 必须处于 `[0, vocab_size)`。
 
-当前训练示例没有学习率调度、验证集评估和断点恢复。正式训练时建议先实现这些
-功能，再按实际显存调整 `batch_size`、`context_length`、`d_model` 和层数。
+`train.py` 已包含二进制 token 缓存、内存映射数据采样、验证集评估、Muon
+优化器、warmup + 余弦学习率调度和完整 checkpoint 恢复。正式训练时可按实际
+显存调整 `batch_size`、`context_length`、`d_model` 和层数。
 
 ## 调试方法
 
@@ -380,9 +523,10 @@ PYTHONDONTWRITEBYTECODE=1 uv run pytest -q
 ```
 
 当前测试覆盖 RMSNorm、RoPE、模型前向与反向传播、因果掩码、上下文长度限制、
-embedding tying 和交叉熵，并包含 Stanford CS336 官方的 tokenizer 与 BPE 测试。
-官方 BPE 速度测试要求小语料训练在 1.5 秒内完成；当前实现约需 2.1 秒，因此完整
-测试套件会在 `test_train_bpe_speed` 处失败。
+embedding tying、交叉熵、Muon 正交化、非矩阵回退、余弦学习率调度、批次采样和
+checkpoint 恢复，并包含 Stanford CS336 官方的 tokenizer 与 BPE 测试。官方 BPE
+速度测试要求小语料训练在 1.5 秒内完成；当前实现约需 2.1 秒，因此完整测试套件
+会在 `test_train_bpe_speed` 处失败。
 
 ## 已知问题
 

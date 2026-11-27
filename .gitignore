@@ -14,4 +14,7 @@ wheels/
 
 #datafiles
 data/TinyStoriesV2-GPT4-train.txt
+data/*.bin
+data/*.bin.json
+/checkpoints/
 

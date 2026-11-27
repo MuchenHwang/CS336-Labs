@@ -1,52 +1,97 @@
 import numpy
 import torch
 
-from .adapters import get_adamw_cls, run_get_lr_cosine_schedule
+from cs336.optimizer import (
+    Muon,
+    zeropower_via_newtonschulz5,
+)
+from .adapters import get_muon_cls, run_get_lr_cosine_schedule
 
 
-def _optimize(opt_class) -> torch.Tensor:
-    torch.manual_seed(42)
-    model = torch.nn.Linear(3, 2, bias=False)
-    opt = opt_class(
-        model.parameters(),
+def test_muon_adapter():
+    assert get_muon_cls() is Muon
+
+    parameter = torch.nn.Parameter(torch.ones(2, 2))
+    parameter.grad = torch.ones_like(parameter)
+    optimizer = Muon(
+        [parameter],
         lr=1e-3,
-        weight_decay=0.01,
         betas=(0.9, 0.999),
         eps=1e-8,
+        weight_decay=0.01,
     )
-    # Use 1000 optimization steps for testing
-    for _ in range(1000):
-        opt.zero_grad()
-        x = torch.rand(model.in_features)
-        y_hat = model(x)
-        y = torch.tensor([x[0] + x[1], -x[2]])
-        loss = ((y - y_hat) ** 2).sum()
-        loss.backward()
-        opt.step()
-    return model.weight.detach()
+    optimizer.step()
+    assert torch.isfinite(parameter).all()
 
 
-def test_adamw(numpy_snapshot):
-    """
-    Our reference implementation yields slightly different results than the
-    PyTorch AdamW, since there are a couple different ways that you can apply
-    weight decay that are equivalent in principle, but differ in practice due to
-    floating point behavior. So, we test that the provided implementation matches
-    _either_ our reference implementation's expected results or those from the PyTorch AdamW.
-    """
-    # expected_weights = torch.load(FIXTURES_PATH / "adamw_expected_params.pt")
-    pytorch_weights = _optimize(torch.optim.AdamW)
-    actual_weights = _optimize(get_adamw_cls())
+def test_newton_schulz_orthogonalizes_matrix():
+    torch.manual_seed(42)
+    gradient = torch.randn(8, 5)
+    update = zeropower_via_newtonschulz5(gradient)
 
-    # Might need to exit early if the weights match pytorch, since that should also be valid
-    matches_pytorch = torch.allclose(actual_weights, pytorch_weights, atol=1e-4)
-    if matches_pytorch:
-        return
+    assert update.shape == gradient.shape
+    assert update.dtype == gradient.dtype
+    assert torch.isfinite(update).all()
 
-    numpy_snapshot.assert_match(
-        actual_weights,
-        atol=1e-4,
+    original_singular_values = torch.linalg.svdvals(
+        gradient / gradient.norm()
     )
+    update_singular_values = torch.linalg.svdvals(update)
+    original_condition = (
+        original_singular_values.max() / original_singular_values.min()
+    )
+    update_condition = (
+        update_singular_values.max() / update_singular_values.min()
+    )
+    assert update_condition < original_condition * 0.5
+
+
+def test_muon_uses_orthogonalized_matrix_update():
+    torch.manual_seed(42)
+    parameter = torch.nn.Parameter(torch.zeros(6, 4))
+    parameter.grad = torch.randn_like(parameter)
+    learning_rate = 0.05
+    optimizer = Muon(
+        [parameter],
+        lr=learning_rate,
+        weight_decay=0.0,
+    )
+
+    optimizer.step()
+
+    gradient = parameter.grad
+    momentum = 0.1 * gradient
+    nesterov_update = gradient.lerp(momentum, 0.9)
+    expected_update = zeropower_via_newtonschulz5(nesterov_update)
+    expected_update *= max(
+        1.0,
+        parameter.size(0) / parameter.size(1),
+    ) ** 0.5
+    torch.testing.assert_close(
+        parameter,
+        -learning_rate * expected_update,
+    )
+
+
+def test_muon_fallback_for_vector_parameters():
+    torch.manual_seed(42)
+    actual = torch.nn.Parameter(torch.tensor([1.0, -2.0, 0.5]))
+    initial = actual.detach().clone()
+    learning_rate = 3e-4
+    optimizer = Muon(
+        [actual],
+        lr=learning_rate,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=0.0,
+    )
+    gradient = torch.tensor([2.0, -3.0, 0.0])
+    actual.grad = gradient
+
+    optimizer.step()
+
+    expected = initial - learning_rate * gradient.sign()
+    torch.testing.assert_close(actual, expected)
 
 
 def test_get_lr_cosine_schedule():

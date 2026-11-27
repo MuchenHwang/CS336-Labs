@@ -13,7 +13,7 @@ from torch import Tensor
 
 from cs336.decoder import BPEDecoder
 from cs336.encoder import BPEEncoder
-from cs336.optimizer import AdamW, get_lr_cosine_schedule
+from cs336.optimizer import Muon, get_lr_cosine_schedule
 from cs336.tokenizer import pre_tokenize, to_bpe_input, train_bpe
 
 
@@ -471,11 +471,11 @@ def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm:
     raise NotImplementedError
 
 
-def get_adamw_cls() -> Any:
+def get_muon_cls() -> Any:
     """
-    Returns a torch.optim.Optimizer that implements AdamW.
+    Return the project's Muon optimizer class.
     """
-    return AdamW
+    return Muon
 
 
 def run_get_lr_cosine_schedule(

@@ -8,8 +8,51 @@ from torch import Tensor
 from torch.optim import Optimizer
 
 
-class AdamW(Optimizer):
-    """Adam with decoupled weight decay."""
+_NEWTON_SCHULZ_COEFFICIENTS = (3.4445, -4.7750, 2.0315)
+
+
+def zeropower_via_newtonschulz5(
+    gradient: Tensor,
+    steps: int = 5,
+) -> Tensor:
+    """Approximate the orthogonal polar factor with Newton-Schulz iteration."""
+    if gradient.ndim != 2:
+        raise ValueError("Muon only supports two-dimensional parameters")
+    if steps < 1:
+        raise ValueError("steps must be at least 1")
+
+    original_dtype = gradient.dtype
+    work_dtype = (
+        torch.float32
+        if original_dtype in (torch.float16, torch.bfloat16)
+        else original_dtype
+    )
+    update = gradient.to(dtype=work_dtype)
+
+    transposed = update.size(0) > update.size(1)
+    if transposed:
+        update = update.mT
+
+    update = update / (update.norm() + 1e-7)
+    a, b, c = _NEWTON_SCHULZ_COEFFICIENTS
+    for _ in range(steps):
+        gram = update @ update.mT
+        polynomial = b * gram + c * (gram @ gram)
+        update = a * update + polynomial @ update
+
+    if transposed:
+        update = update.mT
+    return update.to(dtype=original_dtype)
+
+
+class Muon(Optimizer):
+    """Muon for matrices with an adaptive fallback for other parameters.
+
+    Two-dimensional parameters use momentum followed by Newton-Schulz
+    orthogonalization. Embeddings and gains are not distinguished from hidden
+    weights because the constructor intentionally keeps its original API.
+    One-dimensional and scalar parameters use an adaptive second-moment update.
+    """
 
     def __init__(
         self,
@@ -53,7 +96,25 @@ class AdamW(Optimizer):
                     continue
                 grad = p.grad
                 if grad.is_sparse:
-                    raise RuntimeError("AdamW does not support sparse gradients")
+                    raise RuntimeError("Muon does not support sparse gradients")
+
+                if p.ndim == 2:
+                    momentum = self.state[p].get("momentum_buffer")
+                    if momentum is None:
+                        momentum = torch.zeros_like(
+                            p,
+                            memory_format=torch.preserve_format,
+                        )
+                        self.state[p]["momentum_buffer"] = momentum
+
+                    momentum.lerp_(grad, 1.0 - beta1)
+                    update = grad.lerp(momentum, beta1)
+                    update = zeropower_via_newtonschulz5(update)
+                    update *= max(1.0, p.size(0) / p.size(1)) ** 0.5
+
+                    p.mul_(1.0 - lr * weight_decay)
+                    p.add_(update, alpha=-lr)
+                    continue
 
                 state = self.state[p]
                 if len(state) == 0:
