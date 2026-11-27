@@ -12,6 +12,8 @@
   回退，以及线性 warmup + 余弦退火学习率调度。
 - `src/cs336/train.py`：二进制 token 缓存、内存映射采样、训练循环、验证、
   梯度裁剪和 checkpoint 保存/恢复。
+- `src/cs336/inference.py`：加载训练 checkpoint，执行贪心或随机采样文本生成。
+- `src/cs336/kvcache.py`：KV cache 的追加、形状校验、长度和内存统计。
 - `src/cs336/vector_add_cuda.cu`：PyTorch C++/CUDA 扩展的最小向量加法示例。
 
 以下命令均在项目根目录运行。
@@ -449,6 +451,43 @@ test -f model.pt && echo "model checkpoint found"
 优化器、warmup + 余弦学习率调度和完整 checkpoint 恢复。正式训练时可按实际
 显存调整 `batch_size`、`context_length`、`d_model` 和层数。
 
+## 模型推理
+
+`inference.py` 从训练 checkpoint 读取模型配置和权重，重建 `TransformerLM`，
+然后使用与训练相同的 BPE 词表进行自回归生成：
+
+```bash
+uv run cs336-infer \
+  --checkpoint checkpoints/tinystories.pt \
+  --prompt "Once upon a time" \
+  --max-new-tokens 128 \
+  --temperature 0.8 \
+  --top-k 50 \
+  --top-p 0.95 \
+  --seed 42
+```
+
+使用贪心解码时把 temperature 设为 0：
+
+```bash
+uv run cs336-infer \
+  --checkpoint checkpoints/tinystories.pt \
+  --prompt "Once upon a time" \
+  --max-new-tokens 64 \
+  --temperature 0
+```
+
+默认输出包含原始 prompt；只输出续写内容时增加 `--completion-only`。模型生成
+`<|endoftext|>` 时会提前停止。不传 `--device` 时会优先使用 CUDA。
+
+生成器使用 KV cache：prompt 只执行一次 prefill，之后每个 token 只输入模型一个
+新位置，不再重复计算完整历史。cache 位于 `kvcache.py`，模型通过
+`TransformerLM.forward_with_cache()` 接收和返回各层 K/V。
+
+KV cache 受模型原始 `context_length` 限制。prompt 过长时会保留末尾部分，并为
+生成至少一个 token 留出位置；达到上下文上限后停止。尚未实现滑动窗口 cache
+重定位、无限上下文或批量生成。
+
 ## 调试方法
 
 先检查预分词结果，确认 special token 没有进入普通正则切片：
@@ -524,9 +563,10 @@ PYTHONDONTWRITEBYTECODE=1 uv run pytest -q
 
 当前测试覆盖 RMSNorm、RoPE、模型前向与反向传播、因果掩码、上下文长度限制、
 embedding tying、交叉熵、Muon 正交化、非矩阵回退、余弦学习率调度、批次采样和
-checkpoint 恢复，并包含 Stanford CS336 官方的 tokenizer 与 BPE 测试。官方 BPE
-速度测试要求小语料训练在 1.5 秒内完成；当前实现约需 2.1 秒，因此完整测试套件
-会在 `test_train_bpe_speed` 处失败。
+checkpoint 恢复、采样策略、KV cache 数值一致性和推理生成，并包含 Stanford
+CS336 官方的 tokenizer 与 BPE 测试。官方 BPE 速度测试要求小语料训练在 1.5 秒
+内完成；当前实现约需 2.1 秒，因此完整测试套件会在 `test_train_bpe_speed` 处
+失败。
 
 ## 已知问题
 

@@ -7,6 +7,13 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+from .kvcache import (
+    KVCache,
+    KVCacheLayer,
+    append_key_value,
+    validate_kv_cache,
+)
+
 
 @dataclass(frozen=True)
 class TransformerConfig:
@@ -92,16 +99,17 @@ class RotaryPositionalEmbedding(nn.Module):
         self.register_buffer("cos", angles.cos(), persistent=False)
         self.register_buffer("sin", angles.sin(), persistent=False)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, start_pos: int = 0) -> Tensor:
         sequence_length = x.shape[-2]
-        if sequence_length > self.cos.shape[0]:
+        end_pos = start_pos + sequence_length
+        if start_pos < 0 or end_pos > self.cos.shape[0]:
             raise ValueError(
-                f"Sequence length {sequence_length} exceeds the configured "
-                f"RoPE context length {self.cos.shape[0]}"
+                f"Position range [{start_pos}, {end_pos}) exceeds the "
+                f"configured RoPE context length {self.cos.shape[0]}"
             )
 
-        cos = self.cos[:sequence_length].to(dtype=x.dtype)[None, None, :, :]
-        sin = self.sin[:sequence_length].to(dtype=x.dtype)[None, None, :, :]
+        cos = self.cos[start_pos:end_pos].to(dtype=x.dtype)[None, None, :, :]
+        sin = self.sin[start_pos:end_pos].to(dtype=x.dtype)[None, None, :, :]
 
         even = x[..., 0::2]
         odd = x[..., 1::2]
@@ -139,8 +147,16 @@ class CausalMultiHeadSelfAttention(nn.Module):
         )
         self.attention_dropout = nn.Dropout(config.dropout)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        past_key_value: KVCacheLayer | None = None,
+        use_cache: bool = False,
+    ) -> Tensor | tuple[Tensor, KVCacheLayer]:
         batch_size, sequence_length, d_model = x.shape
+        start_pos = (
+            0 if past_key_value is None else past_key_value[0].shape[-2]
+        )
 
         qkv = self.qkv_projection(x)
         query, key, value = qkv.chunk(3, dim=-1)
@@ -163,35 +179,47 @@ class CausalMultiHeadSelfAttention(nn.Module):
             self.head_dim,
         ).transpose(1, 2)
 
-        query = self.rope(query)
-        key = self.rope(key)
+        query = self.rope(query, start_pos=start_pos)
+        key = self.rope(key, start_pos=start_pos)
+        key, value = append_key_value(past_key_value, key, value)
 
-        attention_scores = query @ key.transpose(-2, -1)
-        attention_scores = attention_scores / math.sqrt(self.head_dim)
-
-        causal_mask = torch.triu(
-            torch.ones(
-                sequence_length,
-                sequence_length,
-                dtype=torch.bool,
+        if past_key_value is None:
+            attended = F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                dropout_p=(
+                    self.attention_dropout.p if self.training else 0.0
+                ),
+                is_causal=True,
+            )
+        else:
+            query_positions = torch.arange(
+                start_pos,
+                start_pos + sequence_length,
                 device=x.device,
-            ),
-            diagonal=1,
-        )
-        attention_scores = attention_scores.masked_fill(
-            causal_mask,
-            torch.finfo(attention_scores.dtype).min,
-        )
-        attention_weights = F.softmax(attention_scores, dim=-1)
-        attention_weights = self.attention_dropout(attention_weights)
-
-        attended = attention_weights @ value
+            )
+            key_positions = torch.arange(key.shape[-2], device=x.device)
+            causal_mask = key_positions[None, :] <= query_positions[:, None]
+            attended = F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=causal_mask[None, None, :, :],
+                dropout_p=(
+                    self.attention_dropout.p if self.training else 0.0
+                ),
+                is_causal=False,
+            )
         attended = attended.transpose(1, 2).reshape(
             batch_size,
             sequence_length,
             d_model,
         )
-        return self.output_projection(attended)
+        output = self.output_projection(attended)
+        if use_cache:
+            return output, (key, value)
+        return output
 
 
 class SwiGLU(nn.Module):
@@ -234,9 +262,28 @@ class TransformerBlock(nn.Module):
         self.mlp = SwiGLU(config)
         self.residual_dropout = nn.Dropout(config.dropout)
 
-    def forward(self, x: Tensor) -> Tensor:
-        x = x + self.residual_dropout(self.attention(self.attention_norm(x)))
+    def forward(
+        self,
+        x: Tensor,
+        past_key_value: KVCacheLayer | None = None,
+        use_cache: bool = False,
+    ) -> Tensor | tuple[Tensor, KVCacheLayer]:
+        if past_key_value is not None or use_cache:
+            attention_output, present = self.attention(
+                self.attention_norm(x),
+                past_key_value=past_key_value,
+                use_cache=True,
+            )
+        else:
+            attention_output = self.attention(self.attention_norm(x))
+            present = None
+
+        x = x + self.residual_dropout(attention_output)
         x = x + self.residual_dropout(self.mlp(self.mlp_norm(x)))
+        if use_cache:
+            if present is None:
+                raise RuntimeError("attention did not return a KV cache")
+            return x, present
         return x
 
 
@@ -302,6 +349,58 @@ class TransformerLM(nn.Module):
             ignore_index=-100,
         )
         return logits, loss
+
+    def forward_with_cache(
+        self,
+        token_ids: Tensor,
+        past_key_values: KVCache | None = None,
+    ) -> tuple[Tensor, KVCache]:
+        """Run one cached prefill/decode step and return logits plus KV cache."""
+        if token_ids.ndim != 2:
+            raise ValueError("token_ids must have shape (batch, sequence)")
+        if token_ids.shape[1] == 0:
+            raise ValueError("token_ids must contain at least one token")
+
+        batch_size, sequence_length = token_ids.shape
+        past_length = 0
+        if past_key_values is None:
+            per_layer_cache: tuple[KVCacheLayer | None, ...] = (
+                None,
+            ) * len(self.layers)
+        else:
+            past_length = validate_kv_cache(
+                past_key_values,
+                num_layers=len(self.layers),
+                batch_size=batch_size,
+                num_heads=self.config.num_heads,
+                head_dim=self.config.d_model // self.config.num_heads,
+                device=self.token_embeddings.weight.device,
+                dtype=self.token_embeddings.weight.dtype,
+            )
+            per_layer_cache = past_key_values
+
+        if past_length + sequence_length > self.config.context_length:
+            raise ValueError(
+                f"Cached sequence length {past_length + sequence_length} "
+                f"exceeds context length {self.config.context_length}"
+            )
+
+        x = self.embedding_dropout(self.token_embeddings(token_ids))
+        presents: list[KVCacheLayer] = []
+        for layer, past_key_value in zip(
+            self.layers,
+            per_layer_cache,
+            strict=True,
+        ):
+            x, present = layer(
+                x,
+                past_key_value=past_key_value,
+                use_cache=True,
+            )
+            presents.append(present)
+
+        logits = self.lm_head(self.final_norm(x))
+        return logits, tuple(presents)
 
 
 def cross_entropy_loss(
